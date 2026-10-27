@@ -1,0 +1,339 @@
+// ESP32 + DHT + LED + Buzzer + Pagina Web
+// Pinos: D2 = Buzzer | D4 = LED | D5 = DHT
+// Bibliotecas: "DHT sensor library" (Adafruit) + "Adafruit Unified Sensor"
+// Acesse pelo navegador o IP que aparece no Serial Monitor.
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+
+// ====== CONFIGURE AQUI ======
+const char* WIFI_SSID  = "Fatec";
+const char* WIFI_SENHA = "";
+// ============================
+
+#define PIN_BUZZER 2   // D2
+#define PIN_LED    4   // D4
+#define PIN_DHT    5   // D5
+
+#define DHTTYPE DHT11  // troque para DHT22 se for o caso
+
+const float TEMP_LIMITE = 20.0;                    // graus Celsius
+const unsigned long INTERVALO_LEITURA = 2000;      // ms
+
+DHT dht(PIN_DHT, DHTTYPE);
+WebServer server(80);
+
+float temperatura = NAN;
+float umidade = NAN;
+bool alarme = false;
+bool erroSensor = true;
+unsigned long ultimaLeitura = 0;
+
+// ---------------- PAGINA HTML ----------------
+const char PAGINA[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor ESP32</title>
+<style>
+  :root{
+    --bg1:#0f172a; --bg2:#1e1b4b; --card:rgba(255,255,255,.06);
+    --borda:rgba(255,255,255,.12); --txt:#e2e8f0; --sub:#94a3b8;
+    --ok:#22c55e; --alerta:#ef4444; --temp:#fb923c; --umid:#38bdf8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    min-height:100vh; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color:var(--txt); background:linear-gradient(135deg,var(--bg1),var(--bg2)) fixed;
+    padding:24px 16px; display:flex; justify-content:center;
+  }
+  .wrap{width:100%; max-width:760px}
+  header{display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; gap:12px; flex-wrap:wrap}
+  h1{font-size:1.4rem; font-weight:700; letter-spacing:.3px}
+  h1 span{color:var(--umid)}
+  .badge{
+    padding:8px 16px; border-radius:999px; font-weight:700; font-size:.85rem;
+    background:rgba(34,197,94,.15); color:var(--ok); border:1px solid var(--ok);
+    display:flex; align-items:center; gap:8px; transition:.3s;
+  }
+  .badge i{width:9px; height:9px; border-radius:50%; background:currentColor; animation:pulse 1.6s infinite}
+  .badge.alerta{background:rgba(239,68,68,.15); color:var(--alerta); border-color:var(--alerta)}
+  .badge.erro{background:rgba(148,163,184,.15); color:var(--sub); border-color:var(--sub)}
+  @keyframes pulse{0%,100%{opacity:1; transform:scale(1)}50%{opacity:.4; transform:scale(1.5)}}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:560px){.grid{grid-template-columns:1fr}}
+  .card{
+    background:var(--card); border:1px solid var(--borda); border-radius:20px;
+    padding:22px; backdrop-filter:blur(10px); box-shadow:0 10px 30px rgba(0,0,0,.25);
+  }
+  .card h2{font-size:.8rem; text-transform:uppercase; letter-spacing:1.5px; color:var(--sub); margin-bottom:10px; font-weight:600}
+  .valor{font-size:3.4rem; font-weight:800; line-height:1}
+  .valor small{font-size:1.4rem; font-weight:600; color:var(--sub); margin-left:4px}
+  #temp{color:var(--temp)} #umid{color:var(--umid)}
+  .card.alerta{border-color:var(--alerta); box-shadow:0 0 30px rgba(239,68,68,.35)}
+  .barra{height:10px; background:rgba(255,255,255,.1); border-radius:99px; margin-top:18px; overflow:hidden}
+  .barra div{height:100%; width:0; border-radius:99px; transition:width .6s}
+  #barraTemp{background:linear-gradient(90deg,#facc15,#ef4444)}
+  #barraUmid{background:linear-gradient(90deg,#38bdf8,#6366f1)}
+  .limite{margin-top:10px; font-size:.8rem; color:var(--sub)}
+  .full{grid-column:1/-1}
+  canvas{width:100%; height:200px; display:block}
+  .legenda{display:flex; gap:18px; margin-top:10px; font-size:.8rem; color:var(--sub)}
+  .legenda b{display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px}
+  .info{display:grid; grid-template-columns:repeat(3,1fr); gap:10px; text-align:center}
+  .info div span{display:block; font-size:.7rem; color:var(--sub); text-transform:uppercase; letter-spacing:1px}
+  .info div strong{font-size:1rem}
+  footer{margin-top:18px; text-align:center; font-size:.75rem; color:var(--sub)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Monitor <span>ESP32</span></h1>
+    <div class="badge" id="badge"><i></i><span id="status">Conectando...</span></div>
+  </header>
+
+  <div class="grid">
+    <div class="card" id="cardTemp">
+      <h2>Temperatura</h2>
+      <div class="valor" id="temp">--<small>&deg;C</small></div>
+      <div class="barra"><div id="barraTemp"></div></div>
+      <div class="limite" id="limite">Limite: -- &deg;C</div>
+    </div>
+
+    <div class="card">
+      <h2>Umidade</h2>
+      <div class="valor" id="umid">--<small>%</small></div>
+      <div class="barra"><div id="barraUmid"></div></div>
+      <div class="limite">Faixa ideal: 40% a 60%</div>
+    </div>
+
+    <div class="card full">
+      <h2>Historico</h2>
+      <canvas id="grafico"></canvas>
+      <div class="legenda">
+        <span><b style="background:var(--temp)"></b>Temperatura</span>
+        <span><b style="background:var(--umid)"></b>Umidade</span>
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="info">
+        <div><span>IP</span><strong id="ip">--</strong></div>
+        <div><span>Sinal Wi-Fi</span><strong id="rssi">--</strong></div>
+        <div><span>Ligado ha</span><strong id="uptime">--</strong></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Ultima atualizacao: <span id="hora">--</span></footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const hT = [], hU = [], MAX = 40;
+
+function fmtUptime(s){
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h > 0 ? h + "h " + m + "min" : m + "min " + (s%60) + "s";
+}
+
+function desenhar(){
+  const c = $("grafico"), r = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * r; c.height = c.clientHeight * r;
+  const g = c.getContext("2d"); g.scale(r, r);
+  const W = c.clientWidth, H = c.clientHeight, P = 12;
+  g.clearRect(0, 0, W, H);
+
+  g.strokeStyle = "rgba(255,255,255,.08)"; g.lineWidth = 1;
+  for(let i = 0; i < 5; i++){
+    const y = P + i * (H - 2*P) / 4;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+  }
+
+  function linha(dados, cor){
+    if(dados.length < 2) return;
+    let mn = Math.min(...dados), mx = Math.max(...dados);
+    if(mx - mn < 2){ mn -= 1; mx += 1; }
+    const pts = dados.map((v, i) => [
+      i * W / (MAX - 1),
+      H - P - (v - mn) / (mx - mn) * (H - 2*P)
+    ]);
+    const grad = g.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, cor + "55"); grad.addColorStop(1, cor + "00");
+    g.beginPath(); g.moveTo(pts[0][0], H);
+    pts.forEach(p => g.lineTo(p[0], p[1]));
+    g.lineTo(pts[pts.length-1][0], H); g.closePath();
+    g.fillStyle = grad; g.fill();
+    g.beginPath();
+    pts.forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]));
+    g.strokeStyle = cor; g.lineWidth = 2.5; g.lineJoin = "round"; g.stroke();
+    const u = pts[pts.length-1];
+    g.beginPath(); g.arc(u[0], u[1], 4, 0, 7); g.fillStyle = cor; g.fill();
+  }
+  linha(hT, "#fb923c");
+  linha(hU, "#38bdf8");
+}
+
+async function atualizar(){
+  try{
+    const d = await (await fetch("/dados")).json();
+    const badge = $("badge");
+    $("limite").innerHTML = "Limite: " + d.limite + " &deg;C";
+
+    if(d.erro){
+      badge.className = "badge erro"; $("status").textContent = "Erro no sensor";
+    } else {
+      $("temp").innerHTML = d.temp.toFixed(1) + "<small>&deg;C</small>";
+      $("umid").innerHTML = d.umid.toFixed(0) + "<small>%</small>";
+      $("barraTemp").style.width = Math.max(0, Math.min(100, d.temp / 50 * 100)) + "%";
+      $("barraUmid").style.width = Math.max(0, Math.min(100, d.umid)) + "%";
+      badge.className = d.alarme ? "badge alerta" : "badge";
+      $("status").textContent = d.alarme ? "ALERTA: temperatura alta" : "Tudo normal";
+      $("cardTemp").className = d.alarme ? "card alerta" : "card";
+      hT.push(d.temp); hU.push(d.umid);
+      if(hT.length > MAX){ hT.shift(); hU.shift(); }
+      desenhar();
+    }
+    $("ip").textContent = d.ip;
+    $("rssi").textContent = d.rssi + " dBm";
+    $("uptime").textContent = fmtUptime(d.uptime);
+    $("hora").textContent = new Date().toLocaleTimeString("pt-BR");
+  } catch(e){
+    $("badge").className = "badge erro";
+    $("status").textContent = "Sem conexao com o ESP32";
+  }
+}
+
+window.addEventListener("resize", desenhar);
+atualizar();
+setInterval(atualizar, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------------- FUNCOES ----------------
+
+// Espera sem travar o servidor web
+void esperar(unsigned long ms) {
+  unsigned long ini = millis();
+  while (millis() - ini < ms) {
+    server.handleClient();
+    delay(1);
+  }
+}
+
+void bipe(int vezes, int duracao) {
+  for (int i = 0; i < vezes; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    esperar(duracao);
+    digitalWrite(PIN_BUZZER, LOW);
+    esperar(duracao);
+  }
+}
+
+void paginaInicial() {
+  server.send_P(200, "text/html", PAGINA);
+}
+
+void enviarDados() {
+  String json = "{";
+  json += "\"temp\":" + String(erroSensor ? 0.0 : temperatura, 1) + ",";
+  json += "\"umid\":" + String(erroSensor ? 0.0 : umidade, 1) + ",";
+  json += "\"limite\":" + String(TEMP_LIMITE, 1) + ",";
+  json += "\"alarme\":" + String(alarme ? "true" : "false") + ",";
+  json += "\"erro\":" + String(erroSensor ? "true" : "false") + ",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"uptime\":" + String(millis() / 1000);
+  json += "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void lerSensor() {
+  float u = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(u) || isnan(t)) {
+    erroSensor = true;
+    alarme = false;
+    Serial.println("Erro ao ler o DHT! Verifique a ligacao no D5.");
+    digitalWrite(PIN_LED, HIGH);
+    bipe(2, 80);
+    digitalWrite(PIN_LED, LOW);
+    return;
+  }
+
+  erroSensor = false;
+  temperatura = t;
+  umidade = u;
+  alarme = (temperatura >= TEMP_LIMITE);
+
+  Serial.printf("Temperatura: %.1f C | Umidade: %.1f %%\n", temperatura, umidade);
+
+  if (alarme) {
+    Serial.println("ALERTA: temperatura acima do limite!");
+    digitalWrite(PIN_LED, HIGH);
+    bipe(3, 200);
+  } else {
+    digitalWrite(PIN_LED, LOW);
+    digitalWrite(PIN_BUZZER, LOW);
+  }
+}
+
+// ---------------- SETUP / LOOP ----------------
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  dht.begin();
+
+  // Conecta no Wi-Fi (LED pisca enquanto tenta)
+  Serial.printf("Conectando em %s ", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  if (strlen(WIFI_SENHA) == 0) {
+    WiFi.begin(WIFI_SSID);               // rede aberta
+  } else {
+    WiFi.begin(WIFI_SSID, WIFI_SENHA);   // rede com senha
+  }
+  unsigned long ini = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - ini < 20000) {
+    digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+    delay(300);
+    Serial.print(".");
+  }
+  digitalWrite(PIN_LED, LOW);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConectado!");
+    Serial.print("Abra no navegador: http://");
+    Serial.println(WiFi.localIP());
+    bipe(1, 150);
+  } else {
+    Serial.println("\nFalha no Wi-Fi. Verifique nome e senha.");
+    bipe(3, 300);
+  }
+
+  server.on("/", paginaInicial);
+  server.on("/dados", enviarDados);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - ultimaLeitura >= INTERVALO_LEITURA) {
+    ultimaLeitura = millis();
+    lerSensor();
+  }
+}
