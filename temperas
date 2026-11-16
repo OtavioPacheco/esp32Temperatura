@@ -8,15 +8,15 @@
 #include <DHT.h>
 
 // ====== CONFIGURE AQUI ======
-const char* WIFI_SSID  = "Fatec";
+const char* WIFI_SSID = "Fatec";
 const char* WIFI_SENHA = "";
 // ============================
 
-#define PIN_BUZZER 2   // D2
-#define PIN_LED    4   // D4
-#define PIN_DHT    5   // D5
+#define PIN_BUZZER 2   
+#define PIN_LED    4  
+#define PIN_DHT    5   
 
-#define DHTTYPE DHT11  // troque para DHT22 se for o caso
+#define DHTTYPE DHT11  
 
 const float TEMP_LIMITE = 20.0;                    // graus Celsius
 const unsigned long INTERVALO_LEITURA = 2000;      // ms
@@ -26,7 +26,12 @@ WebServer server(80);
 
 float temperatura = NAN;
 float umidade = NAN;
+enum class Modo { Automatico, Silenciado, Manual };
+Modo modo = Modo::Automatico;
 bool alarme = false;
+unsigned int fasesBipe = 0;
+unsigned long proximaFase = 0;
+unsigned long duracaoFase = 0;
 bool erroSensor = true;
 unsigned long ultimaLeitura = 0;
 
@@ -87,6 +92,9 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   .info div span{display:block; font-size:.7rem; color:var(--sub); text-transform:uppercase; letter-spacing:1px}
   .info div strong{font-size:1rem}
   footer{margin-top:18px; text-align:center; font-size:.75rem; color:var(--sub)}
+  .controles { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .controles button { padding:10px 14px; border:1px solid var(--borda); border-radius:8px; background:var(--bg1); color:var(--txt); cursor:pointer; }
+  .controles button[aria-pressed="true"] { border-color:var(--umid); color:var(--umid); }
 </style>
 </head>
 <body>
@@ -97,6 +105,15 @@ const char PAGINA[] PROGMEM = R"rawliteral(
   </header>
 
   <div class="grid">
+    <section class="card full">
+      <h2>Controle do alerta</h2>
+      <div class="controles" id="controles">
+        <button type="button" data-modo="silenciado" aria-pressed="false">Silenciar alerta</button>
+        <button type="button" data-modo="manual" aria-pressed="false">Acionar alerta</button>
+        <button type="button" data-modo="automatico" aria-pressed="false">Voltar ao automático</button>
+      </div>
+      <p class="limite" id="comando" role="status"></p>
+    </section>
     <div class="card" id="cardTemp">
       <h2>Temperatura</h2>
       <div class="valor" id="temp">--<small>&deg;C</small></div>
@@ -178,22 +195,58 @@ function desenhar(){
   linha(hU, "#38bdf8");
 }
 
+let atualizando = false;
+let enviando = false;
+let revisaoComando = 0;
+
+for (const botao of document.querySelectorAll("#controles button")) {
+  botao.addEventListener("click", async () => {
+    if (enviando) return;
+    enviando = true;
+    ++revisaoComando;
+    $("comando").textContent = "";
+    try {
+      const resposta = await fetch("/alerta?modo=" + botao.dataset.modo, {method:"POST"});
+      if (!resposta.ok) throw new Error("Falha no comando");
+      aplicarModo(await resposta.json());
+    } catch {
+      $("comando").textContent = "Não foi possível alterar o modo.";
+    } finally {
+      enviando = false;
+    }
+  });
+}
+
+function aplicarModo(d) {
+  for (const botao of document.querySelectorAll("#controles button")) {
+    botao.setAttribute("aria-pressed", String(botao.dataset.modo === d.modo));
+  }
+  $("badge").className = d.alarme ? "badge alerta" : d.erro ? "badge erro" : "badge";
+  $("cardTemp").className = d.alarme ? "card alerta" : "card";
+  const estado = d.modo === "manual" ? "Alerta manual" :
+    d.modo === "silenciado" ? "Alerta silenciado" :
+    d.erro ? "Erro no sensor" : d.alarme ? "ALERTA: temperatura alta" : "Tudo normal";
+  $("status").textContent = d.erro && d.modo !== "automatico" ? estado + " · erro no sensor" : estado;
+}
+
 async function atualizar(){
+  if (atualizando || enviando) return;
+  atualizando = true;
+  const revisao = revisaoComando;
   try{
     const d = await (await fetch("/dados")).json();
-    const badge = $("badge");
+    if (enviando || revisao !== revisaoComando) return;
+    aplicarModo(d);
     $("limite").innerHTML = "Limite: " + d.limite + " &deg;C";
 
-    if(d.erro){
-      badge.className = "badge erro"; $("status").textContent = "Erro no sensor";
-    } else {
+    if(!d.erro){
       $("temp").innerHTML = d.temp.toFixed(1) + "<small>&deg;C</small>";
       $("umid").innerHTML = d.umid.toFixed(0) + "<small>%</small>";
       $("barraTemp").style.width = Math.max(0, Math.min(100, d.temp / 50 * 100)) + "%";
       $("barraUmid").style.width = Math.max(0, Math.min(100, d.umid)) + "%";
-      badge.className = d.alarme ? "badge alerta" : "badge";
-      $("status").textContent = d.alarme ? "ALERTA: temperatura alta" : "Tudo normal";
-      $("cardTemp").className = d.alarme ? "card alerta" : "card";
+
+
+
       hT.push(d.temp); hU.push(d.umid);
       if(hT.length > MAX){ hT.shift(); hU.shift(); }
       desenhar();
@@ -203,8 +256,11 @@ async function atualizar(){
     $("uptime").textContent = fmtUptime(d.uptime);
     $("hora").textContent = new Date().toLocaleTimeString("pt-BR");
   } catch(e){
+    if (enviando || revisao !== revisaoComando) return;
     $("badge").className = "badge erro";
-    $("status").textContent = "Sem conexao com o ESP32";
+    $("status").textContent = "Sem conexão com o ESP32";
+  } finally {
+    atualizando = false;
   }
 }
 
@@ -218,21 +274,36 @@ setInterval(atualizar, 2000);
 
 // ---------------- FUNCOES ----------------
 
-// Espera sem travar o servidor web
-void esperar(unsigned long ms) {
-  unsigned long ini = millis();
-  while (millis() - ini < ms) {
-    server.handleClient();
-    delay(1);
-  }
+void pararBipe() {
+  fasesBipe = 0;
+  digitalWrite(PIN_BUZZER, LOW);
 }
 
-void bipe(int vezes, int duracao) {
-  for (int i = 0; i < vezes; i++) {
-    digitalWrite(PIN_BUZZER, HIGH);
-    esperar(duracao);
-    digitalWrite(PIN_BUZZER, LOW);
-    esperar(duracao);
+void bipe(unsigned int vezes, unsigned long duracao) {
+  fasesBipe = vezes * 2;
+  duracaoFase = duracao;
+  proximaFase = millis();
+}
+
+void atualizarBuzzer() {
+  const unsigned long agora = millis();
+  if (fasesBipe == 0 || static_cast<long>(agora - proximaFase) < 0) return;
+
+  digitalWrite(PIN_BUZZER, fasesBipe % 2 == 0 ? HIGH : LOW);
+  --fasesBipe;
+  proximaFase = agora + duracaoFase;
+}
+
+void atualizarAlerta(bool sinalizarErro) {
+  alarme = modo == Modo::Manual ||
+           (modo == Modo::Automatico && !erroSensor && temperatura >= TEMP_LIMITE);
+  digitalWrite(PIN_LED, alarme ? HIGH : LOW);
+  if (alarme) {
+    bipe(3, 200);
+  } else if (modo == Modo::Automatico && erroSensor && sinalizarErro) {
+    bipe(2, 80);
+  } else {
+    pararBipe();
   }
 }
 
@@ -241,7 +312,10 @@ void paginaInicial() {
 }
 
 void enviarDados() {
+  const char* nomeModo = modo == Modo::Manual ? "manual" :
+                         modo == Modo::Silenciado ? "silenciado" : "automatico";
   String json = "{";
+  json += "\"modo\":\"" + String(nomeModo) + "\",";
   json += "\"temp\":" + String(erroSensor ? 0.0 : temperatura, 1) + ",";
   json += "\"umid\":" + String(erroSensor ? 0.0 : umidade, 1) + ",";
   json += "\"limite\":" + String(TEMP_LIMITE, 1) + ",";
@@ -255,35 +329,40 @@ void enviarDados() {
   server.send(200, "application/json", json);
 }
 
+void alterarModo() {
+  const String pedido = server.arg("modo");
+  if (pedido == "automatico") {
+    modo = Modo::Automatico;
+  } else if (pedido == "silenciado") {
+    modo = Modo::Silenciado;
+  } else if (pedido == "manual") {
+    modo = Modo::Manual;
+  } else {
+    server.send(400, "application/json", "{\"erro\":\"Modo invalido\"}");
+    return;
+  }
+
+  pararBipe();
+  atualizarAlerta(false);
+  enviarDados();
+}
+
 void lerSensor() {
   float u = dht.readHumidity();
   float t = dht.readTemperature();
 
   if (isnan(u) || isnan(t)) {
     erroSensor = true;
-    alarme = false;
     Serial.println("Erro ao ler o DHT! Verifique a ligacao no D5.");
-    digitalWrite(PIN_LED, HIGH);
-    bipe(2, 80);
-    digitalWrite(PIN_LED, LOW);
+    atualizarAlerta(true);
     return;
   }
 
   erroSensor = false;
   temperatura = t;
   umidade = u;
-  alarme = (temperatura >= TEMP_LIMITE);
-
   Serial.printf("Temperatura: %.1f C | Umidade: %.1f %%\n", temperatura, umidade);
-
-  if (alarme) {
-    Serial.println("ALERTA: temperatura acima do limite!");
-    digitalWrite(PIN_LED, HIGH);
-    bipe(3, 200);
-  } else {
-    digitalWrite(PIN_LED, LOW);
-    digitalWrite(PIN_BUZZER, LOW);
-  }
+  atualizarAlerta(false);
 }
 
 // ---------------- SETUP / LOOP ----------------
@@ -298,13 +377,12 @@ void setup() {
 
   dht.begin();
 
-  // Conecta no Wi-Fi (LED pisca enquanto tenta)
   Serial.printf("Conectando em %s ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   if (strlen(WIFI_SENHA) == 0) {
-    WiFi.begin(WIFI_SSID);               // rede aberta
+    WiFi.begin(WIFI_SSID);               
   } else {
-    WiFi.begin(WIFI_SSID, WIFI_SENHA);   // rede com senha
+    WiFi.begin(WIFI_SSID, WIFI_SENHA);   
   }
   unsigned long ini = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - ini < 20000) {
@@ -326,11 +404,13 @@ void setup() {
 
   server.on("/", paginaInicial);
   server.on("/dados", enviarDados);
+  server.on("/alerta", HTTP_POST, alterarModo);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+  atualizarBuzzer();
 
   if (millis() - ultimaLeitura >= INTERVALO_LEITURA) {
     ultimaLeitura = millis();
